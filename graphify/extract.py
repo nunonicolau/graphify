@@ -3298,6 +3298,103 @@ _CPP_EXPORT_MACRO_RE = re.compile(
 )
 
 
+_GPU_QUALIFIERS_BY_SUFFIX = {
+    # Metal address-space and function qualifiers (Metal Shading Language
+    # spec, not part of any C++ grammar). "uint" and similar sized-integer
+    # aliases are real Metal types, not qualifiers, so they are left alone.
+    ".metal": frozenset({
+        "kernel", "vertex", "fragment",
+        "device", "constant", "threadgroup", "thread",
+        "ray_data", "object_data",
+    }),
+    # CUDA execution-space and function qualifiers.
+    ".cu": frozenset({
+        "__global__", "__device__", "__host__",
+        "__shared__", "__constant__", "__managed__",
+        "__forceinline__", "__noinline__", "__restrict__",
+    }),
+}
+_GPU_QUALIFIERS_BY_SUFFIX[".cuh"] = _GPU_QUALIFIERS_BY_SUFFIX[".cu"]
+
+_GPU_QUALIFIER_RE_CACHE: dict[frozenset[str], "re.Pattern[bytes]"] = {}
+
+# Line comment, block comment, double-quoted string, or single-quoted char
+# literal, in that preference order (an earlier alternative wins a tie at the
+# same start position). Backslash-escaped quotes stay inside the literal; a
+# line comment stops at the first real newline, matching C++'s own rule that
+# only a literal trailing backslash continues one onto the next line.
+_CPP_COMMENT_OR_STRING_RE = re.compile(
+    rb"//(?:\\\r?\n|[^\n])*"
+    rb"|/\*.*?\*/"
+    rb'|"(?:\\.|[^"\\])*"'
+    rb"|'(?:\\.|[^'\\])*'",
+    re.S,
+)
+
+
+def _cpp_masked_spans(source: bytes) -> list[tuple[int, int]]:
+    """Byte ranges of every comment and string/char literal in ``source``.
+
+    A plain word-boundary qualifier match has no idea it landed inside one of
+    these — blanking a GPU qualifier word that merely appears in a comment or
+    an error message string rewrites content no grammar rule or extracted
+    node ever reads, for no benefit, and is one more way the normalized bytes
+    can diverge from the file on disk (#4550 review). Returned in source
+    order so a caller can skip-ahead past each span instead of re-scanning.
+    """
+    return [m.span() for m in _CPP_COMMENT_OR_STRING_RE.finditer(source)]
+
+
+def _normalize_gpu_qualifiers(source: bytes, path: Path) -> bytes:
+    """Blank Metal/CUDA qualifier keywords tree-sitter-cpp cannot parse (#4550).
+
+    Metal and CUDA are C++-derived GPU dialects that route through this same
+    extractor, but their address-space/execution-space/function qualifiers
+    (``kernel``, ``device``, ``constant``, ``__global__``, ...) are not part
+    of the C++ grammar it actually parses with. Left in place, tree-sitter-cpp
+    reads the qualifier itself as the declaration's type (a ``type_identifier``)
+    and pushes the REAL type into an adjacent ``ERROR`` node, so the qualifier
+    becomes a sourceless, corpus-wide god node that every shader/kernel using
+    it "references" by name.
+
+    These words are legal identifiers in plain C++ (a user type literally
+    named ``device``), so the filter is keyed by the GPU-dialect file
+    extension — ``.cpp``/``.cc``/``.h`` are never touched. Blanking (not
+    deleting) keeps every byte offset, so reported source locations for
+    everything else in the file stay accurate, the same contract
+    ``_normalize_cpp_cli`` already keeps. A match inside a comment or a
+    string/char literal is left untouched (#4550 review): a qualifier word
+    that merely appears in a log message or a doc comment is not the parsing
+    confusion this function exists to fix, and rewriting it would diverge the
+    parsed bytes from the file on disk for no reason.
+    """
+    qualifiers = _GPU_QUALIFIERS_BY_SUFFIX.get(path.suffix.lower())
+    if not qualifiers:
+        return source
+    pattern = _GPU_QUALIFIER_RE_CACHE.get(qualifiers)
+    if pattern is None:
+        pattern = re.compile(
+            b"|".join(rb"\b" + re.escape(q.encode()) + rb"\b" for q in qualifiers)
+        )
+        _GPU_QUALIFIER_RE_CACHE[qualifiers] = pattern
+    masked_spans = _cpp_masked_spans(source)
+    if not masked_spans:
+        return pattern.sub(_blank_keeping_newlines, source)
+    out = bytearray(source)
+    span_idx = 0
+    for m in pattern.finditer(source):
+        start, end = m.span()
+        while span_idx < len(masked_spans) and masked_spans[span_idx][1] <= start:
+            span_idx += 1
+        if (
+            span_idx < len(masked_spans)
+            and masked_spans[span_idx][0] <= start < masked_spans[span_idx][1]
+        ):
+            continue  # inside a comment or string literal -- leave it as is
+        out[start:end] = _blank_keeping_newlines(m)
+    return bytes(out)
+
+
 def _normalize_cpp_export_macros(source: bytes) -> bytes:
     """Blank an export macro between ``class``/``struct`` and the type name.
 
@@ -3356,6 +3453,7 @@ def extract_cpp(path: Path) -> dict:
         return _augment_cpp_string_tests(path, _extract_generic(path, _CPP_CONFIG))
     source_override = _normalize_cpp_cli(source) or source
     source_override = _normalize_cpp_export_macros(source_override)
+    source_override = _normalize_gpu_qualifiers(source_override, path)
     result = _extract_generic(
         path, _CPP_CONFIG, source_override=source_override
     )

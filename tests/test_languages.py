@@ -336,6 +336,20 @@ def test_cuda_host_call_edges():
     assert ("main()", "host_norm()") in calls
 
 
+def test_cuda_qualifiers_mint_no_sourceless_nodes():
+    """#4550: __global__/__device__ are CUDA execution-space qualifiers, not
+    part of the C++ grammar this file parses with. Left in place, the real
+    return type lands in an ERROR node and the qualifier itself becomes a
+    sourceless, corpus-wide god node every kernel/function "references"."""
+    r = extract_cpp(FIXTURES / "sample.cu")
+    sourceless = {n["label"] for n in r["nodes"] if not n.get("source_file")}
+    assert "__global__" not in sourceless
+    assert "__device__" not in sourceless
+    assert not any(n["label"] in ("__global__", "__device__") for n in r["nodes"]), (
+        "a qualifier keyword must not become a node at all, sourced or not"
+    )
+
+
 # Metal Shading Language is a C++14-derived language, so .metal files route
 # through the C++ extractor just like CUDA does.
 
@@ -355,6 +369,75 @@ def test_metal_finds_kernel_function_and_struct():
     assert any("Vec3" in l for l in labels)
     assert any("dot3" in l for l in labels)
     assert any("saxpy" in l for l in labels)
+
+
+def test_metal_qualifiers_mint_no_sourceless_nodes():
+    """#4550: kernel/device/constant are Metal address-space and function
+    qualifiers, not part of the C++ grammar this file parses with. Left in
+    place, the real type lands in an ERROR node and the qualifier itself
+    becomes a sourceless, corpus-wide god node every shader "references"."""
+    r = extract_cpp(FIXTURES / "sample.metal")
+    sourceless = {n["label"] for n in r["nodes"] if not n.get("source_file")}
+    assert sourceless.isdisjoint({"kernel", "device", "constant"})
+    assert not any(n["label"] in ("kernel", "device", "constant") for n in r["nodes"]), (
+        "a qualifier keyword must not become a node at all, sourced or not"
+    )
+
+
+def test_gpu_qualifier_blanking_leaves_comments_and_strings_untouched():
+    """#4550 review: the blanking regex has no idea it landed inside a
+    comment or a string/char literal, so a qualifier word that merely
+    appears in a log message or a doc comment must not be rewritten --
+    nothing reads that text as a node, and altering it diverges the parsed
+    bytes from the file on disk for no reason."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from graphify.extract import _normalize_gpu_qualifiers
+
+    src = (
+        b"// This is a kernel function running on device with constant memory\n"
+        b"kernel void saxpy(\n"
+        b"    device const float* x [[buffer(0)]],\n"
+        b"    constant float& a [[buffer(1)]]\n"
+        b") {\n"
+        b'    const char* msg = "kernel device constant failure";\n'
+        b"    char c = 'x';\n"
+        b"}\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        out = _normalize_gpu_qualifiers(src, _Path(d) / "test.metal")
+    assert b"// This is a kernel function running on device with constant memory" in out
+    assert b'"kernel device constant failure"' in out
+    assert b"'x'" in out
+    # The real, code-position qualifiers are still blanked.
+    assert out.count(b"kernel") == 2  # only the two inside comment/string survive
+    assert out.count(b"device") == 2
+    assert out.count(b"constant") == 2
+
+
+def test_cpp_file_with_a_type_literally_named_device_is_unaffected():
+    """#4550: the qualifier filter is keyed by the GPU-dialect extension, so a
+    plain .cpp file's own type genuinely named `device` (a legal C++
+    identifier) must still resolve normally."""
+    import os
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as d:
+        old = os.getcwd()
+        try:
+            os.chdir(d)
+            p = Path("plain.cpp")
+            p.write_text(
+                "class device {\npublic:\n    void run();\n};\n"
+                "void device::run() {}\n"
+            )
+            r = extract_cpp(p)
+        finally:
+            os.chdir(old)
+    device = next(n for n in r["nodes"] if n["label"] == "device")
+    assert device["source_file"]
 
 
 # ── Ruby ─────────────────────────────────────────────────────────────────────
