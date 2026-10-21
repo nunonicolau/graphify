@@ -127,6 +127,30 @@ def _evidence(node_id: str, nodes_by_id: dict[str, dict[str, Any]],
     return evidence
 
 
+def _owning_class(node_id: str, nodes_by_id: dict[str, dict[str, Any]],
+                  parents: dict[str, set[str]]) -> str | None:
+    """The label of the class/type that owns ``node_id`` as a method, if any.
+
+    A callable with no ``contains`` / ``method`` owner is a free function or a
+    class itself, not a method, so a bare name may still cite it.
+    """
+    for owner in parents.get(node_id, set()):
+        node = nodes_by_id.get(owner)
+        if node is not None and node.get("_callable_class"):
+            return _symbol_label(node)
+    return None
+
+
+def _owner_is_mentioned(node_id: str, nodes_by_id: dict[str, dict[str, Any]],
+                        parents: dict[str, set[str]], mentioned: set[str]) -> bool:
+    """Whether any class/type owning ``node_id`` is named by a mention here."""
+    for owner in parents.get(node_id, set()):
+        node = nodes_by_id.get(owner)
+        if node is not None and _symbol_label(node) in mentioned:
+            return True
+    return False
+
+
 def _markdown_raw_calls(per_file: list[dict]) -> list[dict]:
     calls: list[dict] = []
     for result in per_file:
@@ -171,6 +195,18 @@ def resolve_markdown_mentions(
             parents.setdefault(str(e.get("target")), set()).add(str(e.get("source")))
     nodes_by_id = {n["id"]: n for n in all_nodes if n.get("id")}
     node_ids = set(nodes_by_id)
+    # Every symbol name each document cites, so a bare method name can check
+    # whether its owner class is named alongside it in the same document
+    # (#4609). Scoped per file: a class named in another document says
+    # nothing about this one.
+    mentioned_labels: dict[str, set[str]] = {}
+    for rc in mentions:
+        labels = mentioned_labels.setdefault(str(rc.get("source_file", "")), set())
+        callee = str(rc.get("callee", "")).strip()
+        if callee:
+            labels.add(callee)
+        for qualifier in rc.get("qualifiers") or []:
+            labels.add(str(qualifier))
     existing = {
         (e.get("source"), e.get("target"))
         for e in all_edges if e.get("relation") == "references"
@@ -213,6 +249,22 @@ def resolve_markdown_mentions(
                 c for c in by_label.get(callee, [])
                 if qualifiers <= _evidence(c, nodes_by_id, parents)
             ]
+            # A parenthesis-less bare word is prose, not a call: `redis` the
+            # server must not link to a lone `redis()` method on an unrelated
+            # class (#4609). Keep the match only when the method's owner class
+            # is itself named in this document (`HandlerResult` beside
+            # `successWithWarnings`); a real call site writes `redis()`.
+            if not qualifiers and "(" not in str(rc.get("context", "")):
+                candidates = [
+                    c for c in candidates
+                    if not _owning_class(c, nodes_by_id, parents)
+                    or _owner_is_mentioned(
+                        c,
+                        nodes_by_id,
+                        parents,
+                        mentioned_labels.get(str(rc.get("source_file", "")), set()),
+                    )
+                ]
             target = candidates[0] if len(candidates) == 1 else None
             confidence, score = "INFERRED", 0.95
         if target is None or target == caller or (caller, target) in existing:
